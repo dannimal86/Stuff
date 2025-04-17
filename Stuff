@@ -2,7 +2,8 @@
 library(ggplot2)
 library(dplyr)
 library(lubridate)
-library(scales) # For formatting the secondary axis
+library(tidyr)
+library(scales)
 
 # Read the CSV file
 data <- read.csv("your_file.csv", stringsAsFactors = FALSE)
@@ -23,23 +24,18 @@ cumulative_data <- data %>%
   mutate(cum_qty = cumsum(qty_change)) %>%
   ungroup()
 
-# Prepare data for stacked bar chart
+# Prepare data for stacked bar chart - fixing the pivot_wider issue
 bar_data <- cumulative_data %>%
   select(exchange_time, side, cum_qty) %>%
-  # Convert to wide format for stacking
-  tidyr::pivot_wider(
+  # Correctly handle the pivot operations
+  pivot_wider(
     names_from = side,
     values_from = cum_qty,
-    values_fill = list(cum_qty = 0)
-  ) %>%
-  # Ensure Buy and Sell columns exist
-  mutate(
-    Buy = ifelse(is.na(Buy), 0, Buy),
-    Sell = ifelse(is.na(Sell), 0, Sell)
+    values_fill = 0  # Simply fill with 0 instead of using a list
   ) %>%
   # Convert back to long format for ggplot
-  tidyr::pivot_longer(
-    cols = c(Buy, Sell),
+  pivot_longer(
+    cols = c("Buy", "Sell"),
     names_to = "side",
     values_to = "cum_qty"
   )
@@ -57,9 +53,10 @@ net_position <- data %>%
   mutate(net_position = cumsum(exec_change))
 
 # Find the range of values for scaling the secondary axis
-max_cum_qty <- max(abs(bar_data$cum_qty))
-max_net_pos <- max(abs(net_position$net_position))
-scaling_factor <- max_cum_qty / max_net_pos
+max_cum_qty <- max(abs(bar_data$cum_qty), na.rm = TRUE)
+max_net_pos <- max(abs(net_position$net_position), na.rm = TRUE)
+# Avoid division by zero
+scaling_factor <- if(max_net_pos > 0) max_cum_qty / max_net_pos else 1
 
 # Create the plot with dual axis
 ggplot() +
@@ -80,14 +77,10 @@ ggplot() +
   ) +
   # Bar chart color scheme
   scale_fill_manual(values = c("Buy" = "blue", "Sell" = "red"), name = "Side") +
-  # Primary y-axis
+  # Primary and secondary y-axis
   scale_y_continuous(
     name = "Cumulative Leave Quantity",
-    labels = scales::comma
-  ) +
-  # Secondary y-axis
-  scale_y_continuous(
-    name = "Cumulative Leave Quantity",
+    labels = scales::comma,
     sec.axis = sec_axis(
       ~ . / scaling_factor,
       name = "Net Position (Executed Qty)",
@@ -107,30 +100,4 @@ ggplot() +
     legend.position = "top",
     axis.title.y.left = element_text(color = "darkgrey"),
     axis.title.y.right = element_text(color = "black")
-  )
-
-# If you want to see more detail, you can also create a time-binned version
-# This is useful if your data spans a long period
-time_binned <- bar_data %>%
-  mutate(time_bin = cut(exchange_time, breaks = "1 hour")) # Adjust time bin as needed
-
-ggplot() +
-  # Stacked bar chart for leave quantities by time bin
-  geom_bar(
-    data = time_binned,
-    aes(x = time_bin, y = cum_qty, fill = side),
-    stat = "identity",
-    position = "stack"
-  ) +
-  scale_fill_manual(values = c("Buy" = "blue", "Sell" = "red")) +
-  labs(
-    title = "Hourly Order Activity",
-    x = "Time Period",
-    y = "Cumulative Leave Quantity",
-    fill = "Side"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    plot.title = element_text(hjust = 0.5, face = "bold")
   )
