@@ -2,6 +2,7 @@
 library(ggplot2)
 library(dplyr)
 library(lubridate)
+library(scales) # For formatting the secondary axis
 
 # Read the CSV file
 data <- read.csv("your_file.csv", stringsAsFactors = FALSE)
@@ -9,64 +10,127 @@ data <- read.csv("your_file.csv", stringsAsFactors = FALSE)
 # Convert exchange_time to POSIXct format
 data$exchange_time <- dmy_hms(data$exchange_time)
 
-# Filter for working orders only (excluding Non-Working actions)
-working_orders <- data %>%
-  filter(action != "Non-Working")
-
-# Calculate working quantity (this would be leavesqty for active orders)
-# For this visualization, we'll use leavesqty as the working quantity
-
-# Create the plot
-ggplot(working_orders, aes(x = exchange_time, y = leavesqty, color = side)) +
-  geom_point(alpha = 0.7) +
-  geom_line(aes(group = interaction(side, cumsum(action == "CREATE_ORDER"))), alpha = 0.5) +
-  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
-  labs(
-    title = "Order Working Quantity Over Time",
-    x = "Time",
-    y = "Working Quantity",
-    color = "Side"
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold"),
-    legend.position = "top"
-  )
-
-# If you want to see the activity by order type as well, you can create a faceted plot
-ggplot(working_orders, aes(x = exchange_time, y = leavesqty, color = side)) +
-  geom_point(alpha = 0.7) +
-  facet_wrap(~action) +
-  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
-  labs(
-    title = "Order Working Quantity by Action Type",
-    x = "Time",
-    y = "Working Quantity",
-    color = "Side"
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold"),
-    legend.position = "top"
-  )
-
-# You might also want to see cumulative quantities over time by side
-cumulative_data <- working_orders %>%
+# Calculate cumulative leave quantities by side, accounting for Non-Working actions
+cumulative_data <- data %>%
   arrange(exchange_time) %>%
+  mutate(
+    qty_change = case_when(
+      action == "Non-Working" ~ -orderquantity, # Subtract for Non-Working
+      TRUE ~ leavequantity # Otherwise use leave quantity
+    )
+  ) %>%
   group_by(side) %>%
-  mutate(cum_qty = cumsum(leavesqty))
+  mutate(cum_qty = cumsum(qty_change)) %>%
+  ungroup()
 
-ggplot(cumulative_data, aes(x = exchange_time, y = cum_qty, color = side)) +
-  geom_line() +
-  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
+# Prepare data for stacked bar chart
+bar_data <- cumulative_data %>%
+  select(exchange_time, side, cum_qty) %>%
+  # Convert to wide format for stacking
+  tidyr::pivot_wider(
+    names_from = side,
+    values_from = cum_qty,
+    values_fill = list(cum_qty = 0)
+  ) %>%
+  # Ensure Buy and Sell columns exist
+  mutate(
+    Buy = ifelse(is.na(Buy), 0, Buy),
+    Sell = ifelse(is.na(Sell), 0, Sell)
+  ) %>%
+  # Convert back to long format for ggplot
+  tidyr::pivot_longer(
+    cols = c(Buy, Sell),
+    names_to = "side",
+    values_to = "cum_qty"
+  )
+
+# Calculate net position from executedqty
+net_position <- data %>%
+  arrange(exchange_time) %>%
+  mutate(
+    exec_change = case_when(
+      side == "Buy" ~ executedqty,
+      side == "Sell" ~ -executedqty,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(net_position = cumsum(exec_change))
+
+# Find the range of values for scaling the secondary axis
+max_cum_qty <- max(abs(bar_data$cum_qty))
+max_net_pos <- max(abs(net_position$net_position))
+scaling_factor <- max_cum_qty / max_net_pos
+
+# Create the plot with dual axis
+ggplot() +
+  # Stacked bar chart for leave quantities
+  geom_bar(
+    data = bar_data,
+    aes(x = exchange_time, y = cum_qty, fill = side),
+    stat = "identity",
+    position = "stack",
+    alpha = 0.7
+  ) +
+  # Line for net position on secondary axis
+  geom_line(
+    data = net_position,
+    aes(x = exchange_time, y = net_position * scaling_factor),
+    color = "black",
+    size = 1.2
+  ) +
+  # Bar chart color scheme
+  scale_fill_manual(values = c("Buy" = "blue", "Sell" = "red"), name = "Side") +
+  # Primary y-axis
+  scale_y_continuous(
+    name = "Cumulative Leave Quantity",
+    labels = scales::comma
+  ) +
+  # Secondary y-axis
+  scale_y_continuous(
+    name = "Cumulative Leave Quantity",
+    sec.axis = sec_axis(
+      ~ . / scaling_factor,
+      name = "Net Position (Executed Qty)",
+      labels = scales::comma
+    )
+  ) +
+  # Other plot elements
   labs(
-    title = "Cumulative Working Quantity Over Time",
-    x = "Time",
-    y = "Cumulative Quantity",
-    color = "Side"
+    title = "Order Activity Over Time",
+    subtitle = "Stacked bars: Cumulative leave quantities | Line: Net position",
+    x = "Time"
   ) +
   theme_minimal() +
   theme(
     plot.title = element_text(hjust = 0.5, face = "bold"),
-    legend.position = "top"
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "top",
+    axis.title.y.left = element_text(color = "darkgrey"),
+    axis.title.y.right = element_text(color = "black")
+  )
+
+# If you want to see more detail, you can also create a time-binned version
+# This is useful if your data spans a long period
+time_binned <- bar_data %>%
+  mutate(time_bin = cut(exchange_time, breaks = "1 hour")) # Adjust time bin as needed
+
+ggplot() +
+  # Stacked bar chart for leave quantities by time bin
+  geom_bar(
+    data = time_binned,
+    aes(x = time_bin, y = cum_qty, fill = side),
+    stat = "identity",
+    position = "stack"
+  ) +
+  scale_fill_manual(values = c("Buy" = "blue", "Sell" = "red")) +
+  labs(
+    title = "Hourly Order Activity",
+    x = "Time Period",
+    y = "Cumulative Leave Quantity",
+    fill = "Side"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold")
   )
