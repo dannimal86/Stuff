@@ -10,6 +10,18 @@ data <- read.csv("your_file.csv", stringsAsFactors = FALSE)
 # Convert exchange_time to POSIXct format
 data$exchange_time <- dmy_hms(data$exchange_time)
 
+# Let's debug the data types
+str(data)
+
+# Ensure all numeric columns are properly converted to numeric
+data <- data %>%
+  mutate(
+    orderquantity = as.numeric(orderquantity),
+    leavequantity = as.numeric(leavequantity),
+    executedqty = as.numeric(executedqty),
+    orderprice = as.numeric(orderprice)
+  )
+
 # Calculate cumulative leave quantities by side, accounting for Non-Working actions
 buy_data <- data %>%
   filter(side == "Buy") %>%
@@ -20,7 +32,7 @@ buy_data <- data %>%
       TRUE ~ leavequantity
     )
   ) %>%
-  mutate(cum_qty = cumsum(qty_change))
+  mutate(cum_qty = cumsum(as.numeric(qty_change)))
 
 sell_data <- data %>%
   filter(side == "Sell") %>%
@@ -31,52 +43,70 @@ sell_data <- data %>%
       TRUE ~ leavequantity
     )
   ) %>%
-  mutate(cum_qty = cumsum(qty_change))
+  mutate(cum_qty = cumsum(as.numeric(qty_change)))
 
-# Calculate net position from executedqty
+# Break down the net position calculation into steps for debugging
 net_position <- data %>%
   arrange(exchange_time) %>%
+  # Create a debugging column to check values
   mutate(
+    exec_qty_numeric = as.numeric(executedqty),
+    # Create change in position based on side
     exec_change = case_when(
-      side == "Buy" ~ executedqty,
-      side == "Sell" ~ -executedqty,
+      side == "Buy" ~ exec_qty_numeric,
+      side == "Sell" ~ -exec_qty_numeric,
       TRUE ~ 0
     )
-  ) %>%
+  )
+
+# Check for NA or non-numeric values
+summary(net_position$exec_change)
+any(is.na(net_position$exec_change))
+
+# Now complete the calculation
+net_position <- net_position %>%
+  # Replace NA values with 0
+  mutate(exec_change = ifelse(is.na(exec_change), 0, exec_change)) %>%
+  # Calculate cumulative sum
   mutate(net_position = cumsum(exec_change))
 
 # Find the range of values for scaling the secondary axis
 max_buy <- max(abs(buy_data$cum_qty), na.rm = TRUE)
 max_sell <- max(abs(sell_data$cum_qty), na.rm = TRUE)
-max_cum_qty <- max(max_buy, max_sell)
+max_cum_qty <- max(max_buy, max_sell, na.rm = TRUE)
 max_net_pos <- max(abs(net_position$net_position), na.rm = TRUE)
 # Avoid division by zero
 scaling_factor <- if(max_net_pos > 0) max_cum_qty / max_net_pos else 1
 
-# Create the plot with dual axis
+# Create the plot with lines
 ggplot() +
-  # Bar chart for Buy quantities
-  geom_col(
+  # Buy quantities
+  geom_line(
     data = buy_data,
-    aes(x = exchange_time, y = cum_qty),
-    fill = "blue",
-    alpha = 0.7
+    aes(x = exchange_time, y = cum_qty, color = "Buy"),
+    size = 1
   ) +
-  # Bar chart for Sell quantities (stacked on top)
-  geom_col(
+  # Sell quantities
+  geom_line(
     data = sell_data, 
-    aes(x = exchange_time, y = cum_qty),
-    fill = "red",
-    alpha = 0.7
+    aes(x = exchange_time, y = cum_qty, color = "Sell"),
+    size = 1
   ) +
-  # Line for net position on secondary axis
+  # Net position
   geom_line(
     data = net_position,
-    aes(x = exchange_time, y = net_position * scaling_factor),
+    aes(x = exchange_time, y = net_position * scaling_factor, linetype = "Net Position"),
     color = "black",
     size = 1.2
   ) +
-  # Primary and secondary y-axis
+  scale_color_manual(
+    name = "Side",
+    values = c("Buy" = "blue", "Sell" = "red")
+  ) +
+  scale_linetype_manual(
+    name = "Position",
+    values = c("Net Position" = "solid")
+  ) +
   scale_y_continuous(
     name = "Cumulative Leave Quantity",
     labels = scales::comma,
@@ -86,38 +116,12 @@ ggplot() +
       labels = scales::comma
     )
   ) +
-  # Other plot elements
   labs(
     title = "Order Activity Over Time",
-    subtitle = "Blue: Buy quantities, Red: Sell quantities, Line: Net position",
     x = "Time"
   ) +
-  # Add a manual legend since we're using separate geoms
-  annotate("rect", xmin = -Inf, xmax = -Inf, ymin = -Inf, ymax = -Inf, 
-           fill = "blue", alpha = 0.7) +
-  annotate("rect", xmin = -Inf, xmax = -Inf, ymin = -Inf, ymax = -Inf, 
-           fill = "red", alpha = 0.7) +
-  annotate("segment", x = -Inf, xend = -Inf, y = -Inf, yend = -Inf,
-           color = "black", size = 1.2) +
   theme_minimal() +
   theme(
     plot.title = element_text(hjust = 0.5, face = "bold"),
-    plot.subtitle = element_text(hjust = 0.5),
-    legend.position = "top",
-    axis.title.y.left = element_text(color = "darkgrey"),
-    axis.title.y.right = element_text(color = "black")
+    legend.position = "top"
   )
-
-# Add proper legend
-p <- last_plot() +
-  scale_fill_manual(
-    name = "Side",
-    values = c("Buy" = "blue", "Sell" = "red"),
-    labels = c("Buy", "Sell")
-  ) +
-  guides(
-    fill = guide_legend(override.aes = list(alpha = 0.7)),
-    color = guide_legend(title = "Net Position")
-  )
-
-print(p)
