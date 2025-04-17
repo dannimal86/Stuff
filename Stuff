@@ -1,0 +1,72 @@
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+# Read the CSV file
+data <- read.csv("your_file.csv", stringsAsFactors = FALSE)
+
+# Convert exchange_time to POSIXct format
+data$exchange_time <- dmy_hms(data$exchange_time)
+
+# Filter for working orders only (excluding Non-Working actions)
+working_orders <- data %>%
+  filter(action != "Non-Working")
+
+# Calculate working quantity (this would be leavesqty for active orders)
+# For this visualization, we'll use leavesqty as the working quantity
+
+# Create the plot
+ggplot(working_orders, aes(x = exchange_time, y = leavesqty, color = side)) +
+  geom_point(alpha = 0.7) +
+  geom_line(aes(group = interaction(side, cumsum(action == "CREATE_ORDER"))), alpha = 0.5) +
+  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
+  labs(
+    title = "Order Working Quantity Over Time",
+    x = "Time",
+    y = "Working Quantity",
+    color = "Side"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+
+# If you want to see the activity by order type as well, you can create a faceted plot
+ggplot(working_orders, aes(x = exchange_time, y = leavesqty, color = side)) +
+  geom_point(alpha = 0.7) +
+  facet_wrap(~action) +
+  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
+  labs(
+    title = "Order Working Quantity by Action Type",
+    x = "Time",
+    y = "Working Quantity",
+    color = "Side"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
+
+# You might also want to see cumulative quantities over time by side
+cumulative_data <- working_orders %>%
+  arrange(exchange_time) %>%
+  group_by(side) %>%
+  mutate(cum_qty = cumsum(leavesqty))
+
+ggplot(cumulative_data, aes(x = exchange_time, y = cum_qty, color = side)) +
+  geom_line() +
+  scale_color_manual(values = c("Buy" = "blue", "Sell" = "red")) +
+  labs(
+    title = "Cumulative Working Quantity Over Time",
+    x = "Time",
+    y = "Cumulative Quantity",
+    color = "Side"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top"
+  )
