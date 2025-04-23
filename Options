@@ -1,0 +1,387 @@
+# Load necessary libraries
+library(Rblpapi)
+library(ggplot2)
+library(dplyr) # For data manipulation (arrange, near)
+
+# --- User Input Section ---
+# Enter the Bloomberg tickers for each option leg (up to 3, but can be more)
+# IMPORTANT: Make sure these are valid option tickers (e.g., "SPX US 09/20/24 C5500 Index")
+option_tickers <- c(
+  "SPX US 09/20/24 C5400 Index", # Example Leg 1: Long Call Butterfly Wing
+  "SPX US 09/20/24 C5500 Index", # Example Leg 2: Short Call Butterfly Body (x2)
+  "SPX US 09/20/24 C5600 Index"  # Example Leg 3: Long Call Butterfly Wing
+#  "SPX US 09/20/24 P5300 Index" # Add more legs if needed
+)
+
+# Specify the position for each ticker: 1 for Long, -1 for Short
+# The order must correspond to the option_tickers vector above
+positions <- c(
+  1,   # Long C5400
+  -2,  # Short 2x C5500
+  1    # Long C5600
+#  1    # Example: Long P5300
+)
+
+# Optional: Set a range multiplier for the payoff plot around the current underlying price
+# The plot will cover CurrentPrice +/- (RangeFactor * AverageStrike)
+# Or adjust the range manually if needed.
+plot_range_factor <- 0.10 # Plot +/- 10% around current price/strikes
+
+# --- End User Input Section ---
+
+# --- Function Definitions ---
+
+# Function to calculate payoff for a single option leg at expiration
+calculate_option_payoff <- function(underlying_price_at_expiry, option_type, strike_price, premium, position) {
+  payoff <- 0
+  if (option_type == "C") { # Call Option
+    intrinsic_value <- pmax(0, underlying_price_at_expiry - strike_price)
+    payoff <- (intrinsic_value - premium) * position
+  } else if (option_type == "P") { # Put Option
+    intrinsic_value <- pmax(0, strike_price - underlying_price_at_expiry)
+    payoff <- (intrinsic_value - premium) * position
+  } else {
+    warning(paste("Unknown option type:", option_type))
+  }
+  # Multiply by the absolute position size (e.g., -2 for short 2 contracts)
+  # The 'position' argument already handles the sign (profit/loss direction)
+  # We assume the premium fetched is per single contract.
+  # If position is e.g. -2, we calculate payoff for -1 and multiply by 2 later?
+  # Let's assume premium is per contract and position includes quantity.
+  # The payoff calculation intrinsically handles the quantity via the 'position' multiplier.
+  # Example: position = -2. Payoff = (intrinsic - premium) * -2. This seems correct.
+  return(payoff)
+}
+
+# Function to identify the strategy name (supports 1, 2, or 3 legs)
+identify_strategy <- function(option_details) {
+  num_legs <- nrow(option_details)
+  strategy_name <- "Custom Strategy" # Default
+
+  # Ensure consistent underlying and expiry before identifying
+  if (length(unique(option_details$Underlying)) > 1 || length(unique(option_details$Expiry)) > 1) {
+     return("Custom Strategy (Multiple Underlyings or Expiries)")
+  }
+
+  # Sort by strike price for consistent identification logic
+  option_details <- option_details %>% arrange(Strike)
+
+  # --- Strategy Identification Logic ---
+
+  if (num_legs == 1) {
+      type_name <- ifelse(option_details$Type[1] == "C", "Call", "Put")
+      pos_name <- ifelse(option_details$Position[1] > 0, "Long", "Short") # Check sign for long/short
+      qty = abs(option_details$Position[1])
+      strategy_name <- trimws(paste(pos_name, ifelse(qty > 1, qty, ""), type_name)) # Add quantity if > 1
+  }
+  else if (num_legs == 2) {
+    leg1 <- option_details[1, ] # Lower strike after sorting
+    leg2 <- option_details[2, ] # Higher strike after sorting
+
+    # Check for Straddle (Same Strike, Call + Put)
+    if (near(leg1$Strike, leg2$Strike) && leg1$Type != leg2$Type) {
+        # Check for standard long/short straddle quantities (+1 C, +1 P or -1 C, -1 P)
+        if (all(option_details$Position == 1)) strategy_name <- "Long Straddle"
+        else if (all(option_details$Position == -1)) strategy_name <- "Short Straddle"
+        # Could add checks for ratio straddles here if needed
+    }
+    # Check for Strangle (Different Strikes, Call + Put, Put Strike < Call Strike)
+    # After sorting, if types differ, lower strike must be Put for standard strangle
+    else if (leg1$Type == "P" && leg2$Type == "C" && !near(leg1$Strike, leg2$Strike)) {
+       if (all(option_details$Position == 1)) strategy_name <- "Long Strangle"
+       else if (all(option_details$Position == -1)) strategy_name <- "Short Strangle"
+       # Could add checks for ratio strangles
+    }
+    # Check for Vertical Spreads (Same Type, Different Strikes)
+    else if (leg1$Type == leg2$Type && !near(leg1$Strike, leg2$Strike)) {
+        type_name <- ifelse(leg1$Type == "C", "Call", "Put")
+        # Long Spread (Buy lower strike, Sell higher strike) - Check signs
+        if (leg1$Position > 0 && leg2$Position < 0 && abs(leg1$Position) == abs(leg2$Position)) {
+            qty = leg1$Position
+            strategy_name <- trimws(paste("Long", ifelse(qty > 1, qty, ""), type_name, "Vertical Spread (Debit Spread)"))
+        }
+        # Short Spread (Sell lower strike, Buy higher strike) - Check signs
+        else if (leg1$Position < 0 && leg2$Position > 0 && abs(leg1$Position) == abs(leg2$Position)) {
+            qty = leg2$Position
+            strategy_name <- trimws(paste("Short", ifelse(qty > 1, qty, ""), type_name, "Vertical Spread (Credit Spread)"))
+        }
+        # Could add checks for ratio vertical spreads
+    }
+  }
+  else if (num_legs == 3) {
+    # Check for Butterflies (3 strikes, all calls or all puts, specific positions)
+    leg1 <- option_details[1, ] # Low strike
+    leg2 <- option_details[2, ] # Mid strike
+    leg3 <- option_details[3, ] # High strike
+
+    # Check if all are Calls or all are Puts
+    all_calls <- all(option_details$Type == "C")
+    all_puts <- all(option_details$Type == "P")
+
+    if (all_calls || all_puts) {
+        type_name <- ifelse(all_calls, "Call", "Put")
+        # Check for equal strike spacing: K2-K1 == K3-K2
+        strike_diff1 <- leg2$Strike - leg1$Strike
+        strike_diff2 <- leg3$Strike - leg2$Strike
+        if (near(strike_diff1, strike_diff2) && strike_diff1 > 0) { # Ensure strikes are distinct and spacing is equal
+            # Check positions for Long Butterfly (+1 K1, -2 K2, +1 K3)
+            if (leg1$Position == 1 && leg2$Position == -2 && leg3$Position == 1) {
+                strategy_name <- paste("Long", type_name, "Butterfly")
+            }
+            # Check positions for Short Butterfly (-1 K1, +2 K2, -1 K3)
+            else if (leg1$Position == -1 && leg2$Position == 2 && leg3$Position == -1) {
+                strategy_name <- paste("Short", type_name, "Butterfly")
+            }
+            # Could add checks for ratio/non-standard butterflies
+        }
+    }
+    # Add checks for other 3-leg strategies (e.g., Ladders) here if needed
+  }
+
+  # If more than 3 legs, or not identified, it remains "Custom Strategy" unless further logic added
+  if (num_legs > 3 && strategy_name == "Custom Strategy") {
+      strategy_name <- paste("Custom Strategy (", num_legs, " legs)", sep="")
+  }
+
+
+  return(strategy_name)
+}
+
+
+# --- Main Script Logic ---
+
+# 1. Connect to Bloomberg
+print("Connecting to Bloomberg...")
+conn <- tryCatch({
+  blpConnect()
+}, error = function(e) {
+  stop("Failed to connect to Bloomberg API. Ensure Bloomberg Terminal is running and API is enabled.", call. = FALSE)
+  return(NULL)
+})
+
+if (is.null(conn)) {
+  # Stop execution if connection failed
+  stop("Exiting script due to connection failure.")
+} else {
+   print("Bloomberg connection successful.")
+}
+
+
+# 2. Fetch Option Data from Bloomberg
+print(paste("Fetching data for:", paste(option_tickers, collapse=", ")))
+fields_to_get <- c("OPT_STRIKE_PX", "OPT_TYP", "PX_LAST", "SECURITY_NAME", "OPT_EXPIRE_DT", "UNDL_SPOT_TICKER")
+
+bbg_data <- tryCatch({
+  bdp(conn, option_tickers, fields_to_get)
+}, error = function(e) {
+  print(paste("Error fetching data from Bloomberg:", e$message))
+  return(NULL)
+})
+
+if (is.null(bbg_data) || nrow(bbg_data) != length(option_tickers)) {
+  blpDisconnect(conn)
+  stop("Failed to retrieve complete data for all tickers. Check tickers and Bloomberg connection.", call. = FALSE)
+}
+
+# 3. Fetch Underlying Data
+# Ensure all options share the same underlying and expiry before proceeding with analysis
+underlying_tickers_found <- unique(bbg_data$UNDL_SPOT_TICKER)
+expiry_dates_found <- unique(as.Date(bbg_data$OPT_EXPIRE_DT, format="%Y%m%d")) # Assuming YYYYMMDD format
+
+if (length(underlying_tickers_found) > 1) {
+    warning("Multiple underlying tickers found: ", paste(underlying_tickers_found, collapse=", "), ". Using the first one for plot range: ", underlying_tickers_found[1])
+} else if (length(underlying_tickers_found) == 0 || is.na(underlying_tickers_found[1])) {
+    blpDisconnect(conn)
+    stop("Could not determine the underlying ticker from the options.", call. = FALSE)
+}
+underlying_ticker <- underlying_tickers_found[1] # Use first one for fetching price
+
+if (length(expiry_dates_found) > 1) {
+    warning("Multiple expiry dates found: ", paste(expiry_dates_found, collapse=", "), ". Payoff calculation assumes simultaneous expiration on the first date found: ", expiry_dates_found[1])
+} else if (length(expiry_dates_found) == 0 || is.na(expiry_dates_found[1])) {
+     warning("Could not determine a unique expiry date.")
+}
+expiry_date <- expiry_dates_found[1] # Use first one for plot subtitle
+
+
+print(paste("Fetching current price for underlying:", underlying_ticker))
+underlying_data <- tryCatch({
+    bdp(conn, underlying_ticker, "PX_LAST")
+}, error = function(e) {
+    print(paste("Warning: Could not fetch underlying price:", e$message))
+    return(NULL) # Continue without current price if fetch fails
+})
+
+current_underlying_price <- if (!is.null(underlying_data)) underlying_data$PX_LAST else NA
+
+
+# 4. Disconnect from Bloomberg (data fetched)
+blpDisconnect(conn)
+print("Disconnected from Bloomberg.")
+
+# 5. Prepare Data Structure
+option_details <- data.frame(
+  Ticker = rownames(bbg_data),
+  Name = bbg_data$SECURITY_NAME,
+  Strike = as.numeric(bbg_data$OPT_STRIKE_PX), # Ensure numeric
+  Type = ifelse(bbg_data$OPT_TYP == "C", "C", "P"), # Ensure only C or P
+  Premium = as.numeric(bbg_data$PX_LAST), # Ensure numeric
+  Position = as.numeric(positions), # Ensure numeric
+  Underlying = bbg_data$UNDL_SPOT_TICKER,
+  Expiry = as.Date(bbg_data$OPT_EXPIRE_DT, format="%Y%m%d") # Assuming YYYYMMDD format
+)
+
+# Basic validation
+if (any(is.na(option_details$Strike)) || any(is.na(option_details$Premium)) || any(is.na(option_details$Position))) {
+    print("Missing critical data (Strike, Premium, or Position) for one or more options:")
+    print(option_details)
+    stop("Please check Bloomberg data availability and input vectors.", call. = FALSE)
+}
+
+print("Option Leg Details (Premiums are per contract):")
+print(option_details[, c("Ticker", "Type", "Strike", "Premium", "Position")]) # Show relevant columns
+
+
+# 6. Identify Strategy
+strategy_name <- identify_strategy(option_details)
+print(paste("Identified Strategy:", strategy_name))
+
+
+# 7. Calculate Payoff Range
+# Determine a sensible range for the underlying price on the x-axis
+min_strike <- min(option_details$Strike)
+max_strike <- max(option_details$Strike)
+avg_strike <- mean(option_details$Strike)
+
+# Use current underlying price if available, otherwise use average strike as center
+center_price <- if (!is.na(current_underlying_price)) current_underlying_price else avg_strike
+
+# Adjust range calculation slightly - use center price * factor, or if strikes are far out, ensure they are included
+range_width <- max(center_price * plot_range_factor, abs(center_price - min_strike)*1.1, abs(center_price - max_strike)*1.1)
+plot_min_price <- max(0, center_price - range_width) # Ensure price doesn't go below 0
+plot_max_price <- center_price + range_width
+
+underlying_prices_at_expiry <- seq(plot_min_price, plot_max_price, length.out = 300) # 300 points for smooth curve
+
+# 8. Calculate Total Strategy Payoff
+total_payoff <- numeric(length(underlying_prices_at_expiry))
+
+for (i in 1:nrow(option_details)) {
+  # Note: calculate_option_payoff uses the Position value directly, which includes quantity (e.g., -2)
+  leg_payoff <- calculate_option_payoff(
+    underlying_price_at_expiry = underlying_prices_at_expiry,
+    option_type = option_details$Type[i],
+    strike_price = option_details$Strike[i],
+    premium = option_details$Premium[i],
+    position = option_details$Position[i]
+  )
+  total_payoff <- total_payoff + leg_payoff
+}
+
+payoff_data <- data.frame(
+  UnderlyingPrice = underlying_prices_at_expiry,
+  TotalPayoff = total_payoff
+)
+
+# 9. Calculate Break-Even Points (Numerical Approximation)
+# Find where the payoff crosses zero
+sign_changes <- diff(sign(payoff_data$TotalPayoff))
+# Add check for points already very close to zero
+near_zero_indices <- which(abs(payoff_data$TotalPayoff) < 1e-6) # Indices where payoff is already near zero
+break_even_indices <- which(sign_changes != 0)
+
+break_even_points <- numeric(0)
+
+# Add points where payoff is already near zero
+if (length(near_zero_indices) > 0) {
+    break_even_points <- c(break_even_points, payoff_data$UnderlyingPrice[near_zero_indices])
+}
+
+# Interpolate where sign changes occur
+if (length(break_even_indices) > 0) {
+  for (idx in break_even_indices) {
+    # Ensure the points aren't already captured by the near_zero check
+    if (!(idx %in% near_zero_indices) && !((idx+1) %in% near_zero_indices)) {
+        x1 <- payoff_data$UnderlyingPrice[idx]
+        y1 <- payoff_data$TotalPayoff[idx]
+        x2 <- payoff_data$UnderlyingPrice[idx + 1]
+        y2 <- payoff_data$TotalPayoff[idx + 1]
+        # Linear interpolation: x = x1 + (x2 - x1) * (-y1 / (y2 - y1))
+        if (abs(y2 - y1) > 1e-6) { # Avoid division by zero
+            be_point <- x1 + (x2 - x1) * (-y1 / (y2 - y1))
+            # Only add if it's within the segment bounds (prevents extrapolation issues)
+            if (be_point >= min(x1, x2) && be_point <= max(x1, x2)) {
+                 break_even_points <- c(break_even_points, be_point)
+            }
+        }
+    }
+  }
+}
+break_even_points <- unique(round(break_even_points, 2)) # Round and remove duplicates
+# Filter out break-even points that are extremely close to each other
+if (length(break_even_points) > 1) {
+    break_even_points <- break_even_points[order(break_even_points)]
+    keep_indices <- c(TRUE, diff(break_even_points) > 0.01) # Keep first, then only if difference > 0.01
+    break_even_points <- break_even_points[keep_indices]
+}
+
+print(paste("Approximate Break-Even Point(s):", paste(break_even_points, collapse=", ")))
+
+
+# 10. Create Payoff Plot
+plot_title <- paste("Payoff Diagram:", strategy_name)
+plot_subtitle <- if (!is.na(expiry_date)) {
+    paste("Underlying:", underlying_ticker, "| Expiry:", expiry_date)
+} else {
+    paste("Underlying:", underlying_ticker)
+}
+
+
+payoff_plot <- ggplot(payoff_data, aes(x = UnderlyingPrice, y = TotalPayoff)) +
+  geom_line(color = "blue", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") + # Zero profit line
+  labs(
+    title = plot_title,
+    subtitle = plot_subtitle,
+    x = "Underlying Price at Expiration",
+    y = "Profit / Loss per Unit Set" # Changed label slightly as payoff depends on position sizes
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+# Add vertical lines for strikes
+# Ensure unique strikes are plotted to avoid overplotting if multiple legs share a strike
+unique_strikes <- unique(option_details[, c("Strike", "Type")])
+for(k in 1:nrow(unique_strikes)) {
+  strike_val <- unique_strikes$Strike[k]
+  # Find associated types for this strike (could be C, P, or both if straddle)
+  types_at_strike <- unique(option_details$Type[near(option_details$Strike, strike_val)])
+  label_text = paste(paste(types_at_strike, collapse="/"), strike_val) # e.g. "C/P 5500" or "C 5400"
+
+  payoff_plot <- payoff_plot + geom_vline(xintercept = strike_val, linetype = "dotted", color = "grey50") +
+                 annotate("text", x = strike_val, y = min(payoff_data$TotalPayoff)*0.9, label = label_text, angle = 90, vjust = -0.5, size = 3, color = "grey30")
+}
+
+# Add vertical lines for break-even points
+if (length(break_even_points) > 0) {
+  # Adjust y-position slightly to avoid overlapping strike labels if possible
+  be_y_pos <- max(payoff_data$TotalPayoff) * 0.9
+  payoff_plot <- payoff_plot + geom_vline(xintercept = break_even_points, linetype = "dashed", color = "red") +
+                 annotate("text", x = break_even_points, y = be_y_pos, label = paste("BE:", break_even_points), angle = 90, vjust = -0.5, hjust=0, size = 3, color = "red")
+}
+
+# Add point for current underlying price if available
+if(!is.na(current_underlying_price)) {
+    # Calculate payoff IF expiration happened now at the current price
+    payoff_at_current <- sum(sapply(1:nrow(option_details), function(i) {
+        calculate_option_payoff(current_underlying_price, option_details$Type[i], option_details$Strike[i], option_details$Premium[i], option_details$Position[i])
+    }))
+    payoff_plot <- payoff_plot + geom_point(aes(x=current_underlying_price, y=payoff_at_current), color="darkgreen", size=3) +
+                   annotate("text", x=current_underlying_price, y=payoff_at_current, label=paste("Current:", round(current_underlying_price,2)), vjust=-1.2, size=3, color="darkgreen")
+}
+
+
+# 11. Display Plot
+print(payoff_plot)
+
+# --- End of Script ---
