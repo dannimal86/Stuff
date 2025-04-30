@@ -1,0 +1,133 @@
+################################################################################
+# Purpose:  Compare the all–in cost of hedging USD exposure with 
+#           ① SGX‐listed currency futures and ② OTC NDFs for INR, CNH & KRW.
+#
+# What “hedging cost” means in this script
+# ----------------------------------------
+#  • NDFs:  Bloomberg publishes outright forward levels (spot + points).  
+#           For a given tenor T the cost is
+#                 CostNDF  = ( Fwd_outright – Spot ) / Spot
+#
+#  • Futures:  SGX futures are quoted as outright rates for the contract month  
+#              (e.g. the front-month futures on INR).  We match each futures  
+#              expiry with the closest standard NDF tenor (1M, 3M, 6M, …).  
+#              CostFUT   = ( Futures_price – Spot ) / Spot
+#
+#  • We express both as an annualised percentage:
+#                 AnnCost = Cost * 12 / Tenor_in_months
+#
+#  • A positive number means it is expensive for the USD-based hedger   
+#    (i.e. you pay forward premium); a negative number is a pickup.
+#
+# Data items we pull from Bloomberg
+# ---------------------------------
+#  Spot:       "USDINR Curncy", "USDCNH Curncy", "USDKRW Curncy"
+#  NDF 1M/3M/6M outrights:  "USDINR1M Curncy", … etc.
+#  SGX front, 2nd & 3rd futures: "INR*1 Index", "CNH*1 Index", "KRW*1 Index"
+#    (replace the * with F1, F2, F3; F1 ≈ 1M, F2 ≈ 2-3M, F3 ≈ 3-6M)
+#
+# Required packages
+# -----------------
+#  • Rblpapi  (Bloomberg Desktop or Server API must be running)
+#  • dplyr, tidyr, lubridate, tibble   (for tidy manipulation)
+#
+# Output
+# ------
+#  A tidy tibble ‘hedge_table’ showing, for each currency & tenor:
+#      Spot, Forward/Futures price, Cost %, Annualised %
+#  plus a small plot (optional) that ranks cheapest hedge per tenor.
+################################################################################
+
+# -------------------------  1. Setup  -----------------------------------------
+library(Rblpapi)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(tibble)
+
+blpConnect()  # will error if the Bloomberg terminal/API is not running
+
+# -------------------------  2. User Inputs  -----------------------------------
+currencies <- c("INR", "CNH", "KRW")
+tenors     <- c("1M","3M","6M")           # NDF tenors we will compare
+today      <- Sys.Date()
+
+# Bloomberg tickers ------------------------------------------------------------
+spot_ticker <- c(INR = "USDINR Curncy",
+                 CNH = "USDCNH Curncy",
+                 KRW = "USDKRW Curncy")
+
+# NDF outright tickers end with tenor code
+ndf_ticker <- function(ccy, tenor){
+  paste0("USD", ccy, tenor, " Curncy")
+}
+
+# SGX futures generic 1/2/3 contracts
+fut_ticker <- c(INR = "INRF", CNH = "CNHF", KRW = "KRWF")   # base
+generic_no <- c("1","2","3")                                # F1 ≈ 1M …
+
+# Map a futures generic to an equivalent tenor in months
+fut_tenor_months <- c(F1 = 1, F2 = 3, F3 = 6)
+
+# ----------------------  3. Pull Spot Prices  ---------------------------------
+spot_px <- bdp(unname(spot_ticker), "PX_LAST") |>
+  mutate(currency = names(spot_ticker)) |>
+  rename(spot = PX_LAST)
+
+# ----------------------  4. Pull NDF Outrights --------------------------------
+ndf_df <- expand_grid(currency = currencies, tenor = tenors) |>
+  mutate(ticker = ndf_ticker(currency, tenor)) |>
+  mutate(fwd_px = bdp(ticker, "PX_LAST")$PX_LAST,
+         tenor_months = as.numeric(sub("M","",tenor))) |>
+  left_join(spot_px, by = "currency") |>
+  mutate(cost_pct = (fwd_px - spot) / spot,
+         ann_cost_pct = cost_pct * 12 / tenor_months,
+         instrument = "NDF") |>
+  select(currency, tenor, tenor_months, instrument,
+         spot, price = fwd_px, cost_pct, ann_cost_pct)
+
+# ----------------------  5. Pull Futures Outrights ----------------------------
+fut_df <- expand_grid(currency = currencies, gen = generic_no) |>
+  mutate(ticker = paste0(fut_ticker[currency], gen, " Index"),
+         price = bdp(ticker, "PX_LAST")$PX_LAST,
+         tenor_months = fut_tenor_months[paste0("F", gen)],
+         instrument = "Futures") |>
+  left_join(spot_px, by = "currency") |>
+  mutate(cost_pct     = (price - spot) / spot,
+         ann_cost_pct = cost_pct * 12 / tenor_months,
+         tenor        = paste0(tenor_months,"M")) |>
+  select(currency, tenor, tenor_months, instrument,
+         spot, price, cost_pct, ann_cost_pct)
+
+# ----------------------  6. Combine & Rank ------------------------------------
+hedge_table <- bind_rows(ndf_df, fut_df) |>
+  arrange(currency, tenor_months, instrument)
+
+# Flag the cheapest instrument for each currency/tenor
+hedge_table <- hedge_table |>
+  group_by(currency, tenor) |>
+  mutate(rank = rank(abs(ann_cost_pct), ties.method = "first"),
+         cheapest = (rank == 1)) |>
+  ungroup()
+
+print(hedge_table, n = Inf)
+
+# ----------------------  7. (Optional) Mini Plot ------------------------------
+# Uncomment the next block if you have ggplot2 installed.
+# library(ggplot2)
+# ggplot(hedge_table, aes(x = tenor, y = ann_cost_pct, fill = instrument)) +
+#   geom_col(position = "dodge") +
+#   facet_wrap(~currency, scales = "free_y") +
+#   labs(title = "Annualised cost of USD hedge: Futures vs NDFs",
+#        y = "Annualised % cost (+ve = pay premium, -ve = pickup)",
+#        x = "Tenor") +
+#   geom_text(aes(label = ifelse(cheapest,
+#                                sprintf("Cheapest\n%.2f%%",ann_cost_pct*100),
+#                                "")),
+#             position = position_dodge(width = 0.9), vjust = -0.4,
+#             size = 3, colour = "black") +
+#   theme_minimal()
+
+################################################################################
+# End of script
+################################################################################
